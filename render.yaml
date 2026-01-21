@@ -8,7 +8,4 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: PORT
-        value: 10000
-    healthCheckPath: /health
     autoDeploy: true
