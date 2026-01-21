@@ -688,15 +688,8 @@ async def main():
         print("📡 Listening for messages...")
         print("🏥 Health check: http://localhost:8080/health")
         
-        # Run polling - FIXED: Use application.run_polling()
-        await application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            timeout=20,
-            read_timeout=20,
-            write_timeout=20,
-            pool_timeout=20
-        )
+       # Just start polling
+       await application.run_polling() 
         
     except asyncio.CancelledError:
         logger.info("Shutdown signal received")
