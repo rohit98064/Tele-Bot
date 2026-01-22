@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Video Downloader Bot - Render.com Deployment
-Fixed version for python-telegram-bot v20+
+Simplified version that works with PTB v20+
 """
 
 import os
@@ -11,14 +11,11 @@ import tempfile
 import asyncio
 import math
 import time
-import signal
-import psutil
 import traceback
 import re
-from typing import Dict, Optional, List, Tuple
+from typing import Optional
 from pathlib import Path
 import shutil
-from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import yt_dlp
@@ -27,15 +24,11 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters
 )
 
 # ============ CONFIGURATION ============
-PORT = int(os.environ.get('PORT', 10000))
-HOST = '0.0.0.0'
-
 # Get bot token from environment
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
@@ -44,10 +37,9 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 # Settings for Render Free Tier
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB (safe for free tier)
-MAX_VIDEO_DURATION = 3600  # 1 hour
-MAX_REQUESTS_PER_USER = 5
-MAX_CONCURRENT_DOWNLOADS = 1  # Only 1 at a time on free tier
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+MAX_VIDEO_DURATION = 1800  # 30 minutes (safer for free tier)
+MAX_CONCURRENT_DOWNLOADS = 1
 
 # Configure logging
 logging.basicConfig(
@@ -61,89 +53,38 @@ logger = logging.getLogger(__name__)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('telegram').setLevel(logging.WARNING)
 
-# ============ DATA CLASSES ============
-@dataclass
-class DownloadRequest:
-    user_id: int
-    url: str
-    platform: str
-    timestamp: float
-    status: str = "pending"
-    file_size: int = 0
-    duration: int = 0
-    quality: str = "best"
-    message_id: Optional[int] = None
-    
-    @property
-    def age(self) -> float:
-        return time.time() - self.timestamp
-
-@dataclass  
-class UserStats:
-    user_id: int
-    username: Optional[str] = None
-    downloads: int = 0
-    last_active: float = field(default_factory=time.time)
-    total_size: int = 0
-    
-    def update_activity(self):
-        self.last_active = time.time()
-
-# ============ MAIN BOT CLASS ============
+# ============ BOT CLASS ============
 class VideoDownloaderBot:
     def __init__(self):
-        self.requests = {}
-        self.user_stats = {}
         self.active_downloads = {}
         self.download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
         
         # Platform detection
         self.supported_platforms = {
-            'youtube': [r'youtube\.com', r'youtu\.be', r'y2u\.be'],
-            'tiktok': [r'tiktok\.com', r'vm\.tiktok\.com', r'vt\.tiktok\.com'],
-            'instagram': [r'instagram\.com', r'instagr\.am'],
-            'twitter': [r'twitter\.com', r'x\.com', r't\.co'],
-            'facebook': [r'facebook\.com', r'fb\.watch', r'fb\.com'],
-            'reddit': [r'reddit\.com', r'redd\.it'],
-            'twitch': [r'twitch\.tv', r'clips\.twitch\.tv'],
-            'dailymotion': [r'dailymotion\.com', r'dai\.ly'],
+            'youtube': [r'youtube\.com', r'youtu\.be'],
+            'tiktok': [r'tiktok\.com'],
+            'instagram': [r'instagram\.com'],
+            'twitter': [r'twitter\.com', r'x\.com'],
+            'facebook': [r'facebook\.com'],
         }
         
-        # Compile patterns
-        self.platform_patterns = {}
-        for platform, patterns in self.supported_platforms.items():
-            compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
-            self.platform_patterns[platform] = compiled
-        
-        # yt-dlp options for Render (optimized)
+        # yt-dlp options
         self.ydl_opts = {
-            'format': 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
-            'merge_output_format': 'mp4',
+            'format': 'best[height<=720]/best',
             'outtmpl': '%(title).100s.%(ext)s',
             'quiet': True,
             'no_warnings': True,
             'ignoreerrors': True,
-            'retries': 2,
-            'fragment_retries': 2,
-            'socket_timeout': 10,
+            'retries': 3,
+            'fragment_retries': 3,
+            'socket_timeout': 30,
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             },
-            'concurrent_fragment_downloads': 1,
-        }
-        
-        # Statistics
-        self.stats = {
-            'total_downloads': 0,
-            'total_size_downloaded': 0,
-            'start_time': time.time(),
-            'errors': 0,
-            'unique_users': set()
         }
         
         # Temp directory
         self.temp_dir = Path(tempfile.mkdtemp(prefix="video_bot_"))
-        
         logger.info(f"Bot initialized. Temp dir: {self.temp_dir}")
     
     # ============ HELPER METHODS ============
@@ -152,7 +93,7 @@ class VideoDownloaderBot:
         """Format file size in human readable format."""
         if size_bytes == 0:
             return "0B"
-        size_name = ("B", "KB", "MB", "GB", "TB")
+        size_name = ("B", "KB", "MB", "GB")
         i = int(math.floor(math.log(size_bytes, 1024)))
         p = math.pow(1024, i)
         s = round(size_bytes / p, 2)
@@ -170,42 +111,36 @@ class VideoDownloaderBot:
         else:
             hours = seconds // 3600
             minutes = (seconds % 3600) // 60
-            secs = seconds % 60
-            return f"{hours}h {minutes}m {secs}s"
+            return f"{hours}h {minutes}m"
     
     def _detect_platform(self, url: str) -> Optional[str]:
         """Detect which platform the URL belongs to."""
         try:
             domain = urlparse(url).netloc.lower()
-            for platform, patterns in self.platform_patterns.items():
+            for platform, patterns in self.supported_platforms.items():
                 for pattern in patterns:
-                    if pattern.search(domain):
+                    if re.search(pattern, domain, re.IGNORECASE):
                         return platform
             return None
-        except Exception as e:
-            logger.debug(f"Error detecting platform: {e}")
+        except Exception:
             return None
     
     @staticmethod
     def _extract_url(text: str) -> Optional[str]:
         """Extract URL from text."""
-        url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[/\w\.\-?=&%#+]*'
+        url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
         matches = re.findall(url_pattern, text)
-        return matches[0] if matches else None
+        if matches:
+            url = matches[0]
+            if not url.startswith('http'):
+                url = 'https://' + url
+            return url
+        return None
     
     # ============ COMMAND HANDLERS ============
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
         user = update.effective_user
-        
-        # Update stats
-        self.stats['unique_users'].add(user.id)
-        
-        if user.id not in self.user_stats:
-            self.user_stats[user.id] = UserStats(
-                user_id=user.id,
-                username=user.username
-            )
         
         welcome_text = f"""
 👋 *Welcome {user.first_name}!*
@@ -215,19 +150,16 @@ class VideoDownloaderBot:
 
 📥 *Supported Platforms:*
 • YouTube, TikTok, Instagram
-• Twitter/X, Facebook, Reddit
-• Twitch, Dailymotion, and more!
+• Twitter/X, Facebook
 
 🚀 *How to use:* Just send any video link!
 
-📊 *Your Statistics:*
-• Downloads: {self.user_stats[user.id].downloads}
-• Total Size: {self._format_size(self.user_stats[user.id].total_size)}
+⚠️ *Limits (Render Free Tier):*
+• Max file: 500MB
+• Max duration: 30 minutes
+• Only 1 download at a time
 
-💡 *Tips:*
-• Use `-fast` for faster downloads
-• Use `-audio` for audio only
-• Max file size: 500MB
+💡 *Tip:* Use `-fast` for faster downloads
 
 Made with ❤️ - Running on Render
         """
@@ -244,47 +176,30 @@ Made with ❤️ - Running on Render
 /stats - Bot statistics
 /cancel - Cancel download
 
-🎯 *Quality Flags (add after URL):*
--best - Best quality
--720 - 720p HD
--1080 - 1080p Full HD
+🎯 *Quality Flags:*
+-fast - Faster download (480p)
 -audio - Audio only (MP3)
--fast - Faster download
 
-⚠️ *Limits (Render Free Tier):*
+⚠️ *Limits:*
 • Max file: 500MB
-• Max duration: 1 hour
+• Max duration: 30 minutes
 • Only 1 download at a time
 
-💡 *Tip:* For long videos, use `-fast` flag!
+💡 *Tip:* For best results, use short videos
         """
         
         await update.message.reply_text(help_text, parse_mode='Markdown')
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stats command."""
-        memory = psutil.virtual_memory()
-        cpu = psutil.cpu_percent(interval=1)
-        uptime = time.time() - self.stats['start_time']
-        
         stats_text = f"""
 📊 *Bot Statistics*
 
-👥 *Users:*
-• Unique: {len(self.stats['unique_users'])}
-• Active: {len(self.active_downloads)}
+📥 *Active Downloads:* {len(self.active_downloads)}
 
-📥 *Downloads:*
-• Total: {self.stats['total_downloads']}
-• Size: {self._format_size(self.stats['total_size_downloaded'])}
-• Errors: {self.stats['errors']}
+🏓 *Status:* ✅ Online on Render
 
-⚙️ *Server Status:*
-• CPU: {cpu:.1f}%
-• Memory: {memory.percent:.1f}%
-• Uptime: {self._format_duration(int(uptime))}
-
-🏓 *Health:* ✅ Online on Render
+🔄 *Restart Bot:* If bot stops responding, wait 1 minute and try again.
         """
         
         await update.message.reply_text(stats_text, parse_mode='Markdown')
@@ -310,14 +225,6 @@ Made with ❤️ - Running on Render
         user = update.effective_user
         message_text = update.message.text.strip()
         
-        # Update user activity
-        if user.id not in self.user_stats:
-            self.user_stats[user.id] = UserStats(
-                user_id=user.id,
-                username=user.username
-            )
-        self.user_stats[user.id].update_activity()
-        
         # Extract URL
         url = self._extract_url(message_text)
         if not url:
@@ -329,7 +236,7 @@ Made with ❤️ - Running on Render
         if not platform:
             await update.message.reply_text(
                 "❌ Unsupported platform!\n"
-                "Supported: YouTube, TikTok, Instagram, Twitter, Facebook, Reddit, etc."
+                "Supported: YouTube, TikTok, Instagram, Twitter, Facebook"
             )
             return
         
@@ -337,10 +244,6 @@ Made with ❤️ - Running on Render
         quality = "best"
         if "-fast" in message_text.lower():
             quality = "fast"
-        elif "-720" in message_text.lower():
-            quality = "720"
-        elif "-1080" in message_text.lower():
-            quality = "1080"
         elif "-audio" in message_text.lower():
             quality = "audio"
         
@@ -355,8 +258,7 @@ Made with ❤️ - Running on Render
                 return
         
         # Process download
-        async with self.download_semaphore:
-            await self._process_download(update, url, platform, quality)
+        await self._process_download(update, url, platform, quality)
     
     async def _process_download(self, update: Update, url: str, platform: str, quality: str):
         """Process download request."""
@@ -399,14 +301,11 @@ Made with ❤️ - Running on Render
             def cleanup(fut):
                 if user.id in self.active_downloads:
                     del self.active_downloads[user.id]
-                if fut.exception():
-                    logger.error(f"Download error: {fut.exception()}")
             
             task.add_done_callback(cleanup)
             
         except Exception as e:
             logger.error(f"Process error: {e}")
-            self.stats['errors'] += 1
             await status_msg.edit_text("❌ Error processing request.")
     
     async def _get_video_info(self, url: str) -> Optional[dict]:
@@ -439,7 +338,6 @@ Made with ❤️ - Running on Render
             await status_msg.edit_text(
                 f"⬇️ *Downloading...*\n"
                 f"📹 *{title}*\n"
-                f"🎯 Quality: {quality}\n"
                 f"🌐 Platform: {platform}\n"
                 f"⏳ Please wait...",
                 parse_mode='Markdown'
@@ -461,11 +359,9 @@ Made with ❤️ - Running on Render
                         }],
                     })
                 elif quality == 'fast':
-                    ydl_opts['format'] = 'best[height<=480]/worst'
-                elif quality.isdigit():
-                    ydl_opts['format'] = f'best[height<={quality}]/worst'
+                    ydl_opts['format'] = 'worst[ext=mp4]'
                 
-                ydl_opts['outtmpl'] = str(temp_path / '%(title)s.%(ext)s')
+                ydl_opts['outtmpl'] = str(temp_path / 'video.%(ext)s')
                 
                 # Download
                 def download():
@@ -492,14 +388,6 @@ Made with ❤️ - Running on Render
                     )
                     return
                 
-                # Update stats
-                self.stats['total_downloads'] += 1
-                self.stats['total_size_downloaded'] += file_size
-                
-                if user.id in self.user_stats:
-                    self.user_stats[user.id].downloads += 1
-                    self.user_stats[user.id].total_size += file_size
-                
                 # Upload status
                 await status_msg.edit_text(
                     f"📤 *Uploading...*\n"
@@ -512,13 +400,13 @@ Made with ❤️ - Running on Render
                 with open(file_path, 'rb') as file:
                     if quality == 'audio':
                         await update.message.reply_audio(
-                            audio=InputFile(file, filename=file_path.name),
+                            audio=InputFile(file),
                             caption=f"✅ Audio downloaded!\nSize: {self._format_size(file_size)}",
                             timeout=300
                         )
                     else:
                         await update.message.reply_video(
-                            video=InputFile(file, filename=file_path.name),
+                            video=InputFile(file),
                             caption=f"✅ Video downloaded!\nSize: {self._format_size(file_size)}",
                             supports_streaming=True,
                             timeout=300
@@ -538,15 +426,12 @@ Made with ❤️ - Running on Render
             
         except Exception as e:
             logger.error(f"Download error for user {user.id}: {e}")
-            self.stats['errors'] += 1
             
             error_msg = "❌ Error downloading video."
             if "File too large" in str(e):
                 error_msg = "❌ File too large (max 500MB)."
             elif "timeout" in str(e).lower():
                 error_msg = "❌ Timeout. Try again with `-fast` flag."
-            elif "memory" in str(e).lower():
-                error_msg = "❌ Server memory limit. Try smaller video."
             
             try:
                 await status_msg.edit_text(error_msg)
@@ -556,99 +441,64 @@ Made with ❤️ - Running on Render
             if user.id in self.active_downloads:
                 del self.active_downloads[user.id]
     
-    async def cleanup_temp_files(self):
+    async def cleanup(self):
         """Clean up temporary files."""
-        while True:
+        if self.temp_dir.exists():
             try:
-                now = time.time()
-                for item in self.temp_dir.glob('*'):
-                    try:
-                        if item.is_file() and (now - item.stat().st_mtime > 1800):
-                            item.unlink(missing_ok=True)
-                        elif item.is_dir() and (now - item.stat().st_mtime > 1800):
-                            shutil.rmtree(item, ignore_errors=True)
-                    except:
-                        pass
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+                logger.info("Cleaned temp directory")
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
-            
-            await asyncio.sleep(900)  # Every 15 minutes
-    
-    async def shutdown_handler(self):
-        """Clean shutdown."""
-        logger.info("Shutting down...")
-        
-        # Cancel downloads
-        for task in self.active_downloads.values():
-            if not task.done():
-                task.cancel()
-        
-        # Wait briefly
-        if self.active_downloads:
-            await asyncio.sleep(2)
-        
-        # Clean temp
-        if self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-        
-        logger.info("Shutdown complete")
 
 # ============ MAIN FUNCTION ============
 async def main():
-    """Main entry point for Render."""
-    print("=" * 60)
-    print("🎬 TELEGRAM VIDEO BOT - RENDER.COM")
-    print("=" * 60)
-    print(f"🤖 Bot Token: {'✅ Set' if BOT_TOKEN else '❌ Not Set'}")
-    print(f"🌐 Host: {HOST}:{PORT}")
-    print(f"🚀 Starting bot...")
-    print("=" * 60)
+    """Main function - SIMPLIFIED for PTB v20+."""
+    print("=" * 50)
+    print("🚀 Telegram Video Bot - Render.com")
+    print("=" * 50)
+    print(f"✅ Bot Token: {'Set' if BOT_TOKEN else 'NOT SET'}")
+    print("🔄 Starting bot...")
+    print("=" * 50)
     
     # Create bot manager
-    bot_manager = VideoDownloaderBot()
+    bot = VideoDownloaderBot()
     
-    # Create application
+    # Create application - SIMPLE version
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
-    application.add_handler(CommandHandler("start", bot_manager.start_command))
-    application.add_handler(CommandHandler("help", bot_manager.help_command))
-    application.add_handler(CommandHandler("stats", bot_manager.stats_command))
-    application.add_handler(CommandHandler("cancel", bot_manager.cancel_command))
+    application.add_handler(CommandHandler("start", bot.start_command))
+    application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("stats", bot.stats_command))
+    application.add_handler(CommandHandler("cancel", bot.cancel_command))
+    
+    # Handle text messages
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
-        bot_manager.handle_message
+        bot.handle_message
     ))
     
-    # Add error handler
+    # Error handler
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-        logger.error(f"Error: {context.error}", exc_info=context.error)
+        logger.error(f"Bot error: {context.error}")
     
     application.add_error_handler(error_handler)
     
-    # Store bot manager
-    application.bot_data['manager'] = bot_manager
+    # Start the bot - SIMPLE way
+    print("🤖 Bot is starting...")
+    print("📡 Ready to receive messages!")
+    print("=" * 50)
     
-    # Start cleanup task
-    asyncio.create_task(bot_manager.cleanup_temp_files())
-    
-    # Start the bot
-    print("🚀 Starting bot polling...")
-    await application.run_polling()
+    await application.run_polling(drop_pending_updates=True)
 
 # ============ ENTRY POINT ============
 if __name__ == '__main__':
-    # Check Python version
-    if sys.version_info < (3, 8):
-        print("❌ Python 3.8+ required")
-        sys.exit(1)
-    
-    # Run the bot
     try:
+        # Run the bot
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
     except Exception as e:
-        print(f"\n💥 Error: {e}")
+        print(f"\n💥 Critical error: {e}")
         traceback.print_exc()
         sys.exit(1)
